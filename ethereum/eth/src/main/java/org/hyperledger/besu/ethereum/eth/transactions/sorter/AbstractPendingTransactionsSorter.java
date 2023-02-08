@@ -134,6 +134,12 @@ public abstract class AbstractPendingTransactionsSorter {
         pendingTransactions::size);
   }
 
+  public void reset() {
+    pendingTransactions.clear();
+    transactionsBySender.clear();
+    lowestInvalidKnownNonceCache.reset();
+  }
+
   public void evictOldTransactions() {
     final Instant removeTransactionsBefore =
         clock.instant().minus(poolConfig.getPendingTxRetentionPeriod(), ChronoUnit.HOURS);
@@ -402,7 +408,11 @@ public abstract class AbstractPendingTransactionsSorter {
             LOG,
             "Transaction {} not added because nonce too far in the future for sender {}",
             transaction::toTraceLog,
-            maybeSenderAccount::toString);
+            () ->
+                maybeSenderAccount
+                    .map(Account::getAddress)
+                    .map(Address::toString)
+                    .orElse("unknown"));
         return NONCE_TOO_FAR_IN_FUTURE_FOR_SENDER;
       }
 

@@ -20,6 +20,7 @@ import org.hyperledger.besu.datatypes.Address;
 import org.hyperledger.besu.datatypes.Hash;
 import org.hyperledger.besu.datatypes.Wei;
 import org.hyperledger.besu.ethereum.rlp.RLP;
+import org.hyperledger.besu.ethereum.trie.MerkleTrieException;
 import org.hyperledger.besu.ethereum.worldstate.StateTrieAccountValue;
 import org.hyperledger.besu.evm.account.Account;
 import org.hyperledger.besu.evm.account.EvmAccount;
@@ -37,6 +38,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 import com.google.common.collect.ForwardingMap;
 import org.apache.tuweni.bytes.Bytes;
@@ -55,6 +57,7 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
   private final Consumer<Hash> storagePreloader;
   private final Map<Address, BonsaiValue<Bytes>> codeToUpdate = new ConcurrentHashMap<>();
   private final Set<Address> storageToClear = Collections.synchronizedSet(new HashSet<>());
+  private final Set<Bytes> emptySlot = Collections.synchronizedSet(new HashSet<>());
 
   // storage sub mapped by _hashed_ key.  This is because in self_destruct calls we need to
   // enumerate the old storage and delete it.  Those are trie stored by hashed key by spec and the
@@ -90,11 +93,12 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
     storageToUpdate.putAll(source.storageToUpdate);
     updatedAccounts.putAll(source.updatedAccounts);
     deletedAccounts.addAll(source.deletedAccounts);
+    emptySlot.addAll(source.emptySlot);
   }
 
   @Override
   public Account get(final Address address) {
-    return super.get(address);
+    return super.getAccount(address);
   }
 
   @Override
@@ -149,18 +153,31 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
 
   @Override
   protected BonsaiAccount getForMutation(final Address address) {
-    final BonsaiValue<BonsaiAccount> bonsaiValue = accountsToUpdate.get(address);
-    if (bonsaiValue == null) {
-      final Account account = wrappedWorldView().get(address);
-      if (account instanceof BonsaiAccount) {
-        final BonsaiAccount mutableAccount = new BonsaiAccount((BonsaiAccount) account, this, true);
-        accountsToUpdate.put(address, new BonsaiValue<>((BonsaiAccount) account, mutableAccount));
-        return mutableAccount;
+    return loadAccount(address, BonsaiValue::getUpdated);
+  }
+
+  protected BonsaiAccount loadAccount(
+      final Address address,
+      final Function<BonsaiValue<BonsaiAccount>, BonsaiAccount> bonsaiAccountFunction) {
+    try {
+      final BonsaiValue<BonsaiAccount> bonsaiValue = accountsToUpdate.get(address);
+      if (bonsaiValue == null) {
+        final Account account = wrappedWorldView().get(address);
+        if (account instanceof BonsaiAccount) {
+          final BonsaiAccount mutableAccount =
+              new BonsaiAccount((BonsaiAccount) account, this, true);
+          accountsToUpdate.put(address, new BonsaiValue<>((BonsaiAccount) account, mutableAccount));
+          return mutableAccount;
+        } else {
+          return null;
+        }
       } else {
-        return null;
+        return bonsaiAccountFunction.apply(bonsaiValue);
       }
-    } else {
-      return bonsaiValue.getUpdated();
+    } catch (MerkleTrieException e) {
+      // need to throw to trigger the heal
+      throw new MerkleTrieException(
+          e.getMessage(), Optional.of(address), e.getHash(), e.getLocation());
     }
   }
 
@@ -192,7 +209,12 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
         codeValue.setUpdated(null);
       } else {
         wrappedWorldView()
-            .getCode(deletedAddress)
+            .getCode(
+                deletedAddress,
+                Optional.ofNullable(accountValue)
+                    .map(BonsaiValue::getPrior)
+                    .map(BonsaiAccount::getCodeHash)
+                    .orElse(Hash.EMPTY))
             .ifPresent(
                 deletedCode ->
                     codeToUpdate.put(deletedAddress, new BonsaiValue<>(deletedCode, null)));
@@ -242,9 +264,9 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
             tracked -> {
               final Address updatedAddress = tracked.getAddress();
               final BonsaiAccount updatedAccount;
+              final BonsaiValue<BonsaiAccount> updatedAccountValue =
+                  accountsToUpdate.get(updatedAddress);
               if (tracked.getWrappedAccount() == null) {
-                final BonsaiValue<BonsaiAccount> updatedAccountValue =
-                    accountsToUpdate.get(updatedAddress);
                 updatedAccount = new BonsaiAccount(this, tracked);
                 tracked.setWrappedAccount(updatedAccount);
                 if (updatedAccountValue == null) {
@@ -272,7 +294,16 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
                     codeToUpdate.computeIfAbsent(
                         updatedAddress,
                         addr ->
-                            new BonsaiValue<>(wrappedWorldView().getCode(addr).orElse(null), null));
+                            new BonsaiValue<>(
+                                wrappedWorldView()
+                                    .getCode(
+                                        addr,
+                                        Optional.ofNullable(updatedAccountValue)
+                                            .map(BonsaiValue::getPrior)
+                                            .map(BonsaiAccount::getCodeHash)
+                                            .orElse(Hash.EMPTY))
+                                    .orElse(null),
+                                null));
                 pendingCode.setUpdated(updatedAccount.getCode());
               }
 
@@ -321,10 +352,10 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
   }
 
   @Override
-  public Optional<Bytes> getCode(final Address address) {
+  public Optional<Bytes> getCode(final Address address, final Hash codeHash) {
     final BonsaiValue<Bytes> localCode = codeToUpdate.get(address);
     if (localCode == null) {
-      return wrappedWorldView().getCode(address);
+      return wrappedWorldView().getCode(address, codeHash);
     } else {
       return Optional.ofNullable(localCode.getUpdated());
     }
@@ -352,18 +383,40 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
         return Optional.ofNullable(value.getUpdated());
       }
     }
-    final Optional<UInt256> valueUInt =
-        wrappedWorldView().getStorageValueBySlotHash(address, slotHash);
-    valueUInt.ifPresent(
-        v ->
-            storageToUpdate
-                .computeIfAbsent(
-                    address,
-                    key ->
-                        new StorageConsumingMap<>(
-                            address, new ConcurrentHashMap<>(), storagePreloader))
-                .put(slotHash, new BonsaiValue<>(v, v)));
-    return valueUInt;
+    final Bytes slot = Bytes.concatenate(Hash.hash(address), slotHash);
+    if (emptySlot.contains(slot)) {
+      return Optional.empty();
+    } else {
+      try {
+        final Optional<UInt256> valueUInt =
+            (wrappedWorldView() instanceof BonsaiPersistedWorldState)
+                ? ((BonsaiPersistedWorldState) wrappedWorldView())
+                    .getStorageValueBySlotHash(
+                        () ->
+                            Optional.ofNullable(loadAccount(address, BonsaiValue::getPrior))
+                                .map(BonsaiAccount::getStorageRoot),
+                        address,
+                        slotHash)
+                : wrappedWorldView().getStorageValueBySlotHash(address, slotHash);
+        valueUInt.ifPresentOrElse(
+            v ->
+                storageToUpdate
+                    .computeIfAbsent(
+                        address,
+                        key ->
+                            new StorageConsumingMap<>(
+                                address, new ConcurrentHashMap<>(), storagePreloader))
+                    .put(slotHash, new BonsaiValue<>(v, v)),
+            () -> {
+              emptySlot.add(Bytes.concatenate(Hash.hash(address), slotHash));
+            });
+        return valueUInt;
+      } catch (MerkleTrieException e) {
+        // need to throw to trigger the heal
+        throw new MerkleTrieException(
+            e.getMessage(), Optional.of(address), e.getHash(), e.getLocation());
+      }
+    }
   }
 
   @Override
@@ -554,15 +607,21 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
 
   private BonsaiValue<BonsaiAccount> loadAccountFromParent(
       final Address address, final BonsaiValue<BonsaiAccount> defaultValue) {
-    final Account parentAccount = wrappedWorldView().get(address);
-    if (parentAccount instanceof BonsaiAccount) {
-      final BonsaiAccount account = (BonsaiAccount) parentAccount;
-      final BonsaiValue<BonsaiAccount> loadedAccountValue =
-          new BonsaiValue<>(new BonsaiAccount(account), account);
-      accountsToUpdate.put(address, loadedAccountValue);
-      return loadedAccountValue;
-    } else {
-      return defaultValue;
+    try {
+      final Account parentAccount = wrappedWorldView().get(address);
+      if (parentAccount instanceof BonsaiAccount) {
+        final BonsaiAccount account = (BonsaiAccount) parentAccount;
+        final BonsaiValue<BonsaiAccount> loadedAccountValue =
+            new BonsaiValue<>(new BonsaiAccount(account), account);
+        accountsToUpdate.put(address, loadedAccountValue);
+        return loadedAccountValue;
+      } else {
+        return defaultValue;
+      }
+    } catch (MerkleTrieException e) {
+      // need to throw to trigger the heal
+      throw new MerkleTrieException(
+          e.getMessage(), Optional.of(address), e.getHash(), e.getLocation());
     }
   }
 
@@ -574,7 +633,11 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
     }
     BonsaiValue<Bytes> codeValue = codeToUpdate.get(address);
     if (codeValue == null) {
-      final Bytes storedCode = wrappedWorldView().getCode(address).orElse(Bytes.EMPTY);
+      final Bytes storedCode =
+          wrappedWorldView()
+              .getCode(
+                  address, Optional.ofNullable(expectedCode).map(Hash::hash).orElse(Hash.EMPTY))
+              .orElse(Bytes.EMPTY);
       if (!storedCode.isEmpty()) {
         codeValue = new BonsaiValue<>(storedCode, storedCode);
         codeToUpdate.put(address, codeValue);
@@ -706,6 +769,7 @@ public class BonsaiWorldStateUpdater extends AbstractWorldUpdater<BonsaiWorldVie
     storageToUpdate.clear();
     codeToUpdate.clear();
     accountsToUpdate.clear();
+    emptySlot.clear();
     super.reset();
   }
 

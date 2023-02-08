@@ -24,21 +24,25 @@ import org.hyperledger.besu.ethereum.chain.MutableBlockchain;
 import org.hyperledger.besu.ethereum.core.Block;
 import org.hyperledger.besu.ethereum.core.BlockHeader;
 import org.hyperledger.besu.ethereum.eth.manager.task.WaitForPeersTask;
+import org.hyperledger.besu.plugin.services.BesuEvents;
 
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 
-public class BackwardsSyncAlgorithm {
+public class BackwardsSyncAlgorithm implements BesuEvents.InitialSyncCompletionListener {
   private static final Logger LOG = getLogger(BackwardsSyncAlgorithm.class);
 
   private final BackwardSyncContext context;
   private final FinalBlockConfirmation finalBlockConfirmation;
+  private final AtomicReference<CountDownLatch> latch =
+      new AtomicReference<>(new CountDownLatch(1));
   private volatile boolean finished = false;
 
   public BackwardsSyncAlgorithm(
@@ -80,11 +84,13 @@ public class BackwardsSyncAlgorithm {
 
     final MutableBlockchain blockchain = context.getProtocolContext().getBlockchain();
     final BlockHeader firstAncestorHeader = maybeFirstAncestorHeader.get();
-    if (blockchain.contains(firstAncestorHeader.getHash())) {
+    final BlockHeader chainHeader = blockchain.getChainHeadHeader();
+    if (blockchain.contains(firstAncestorHeader.getHash())
+        && firstAncestorHeader.getNumber() <= chainHeader.getNumber()) {
       return executeProcessKnownAncestors();
     }
 
-    if (blockchain.getChainHead().getHeight() > firstAncestorHeader.getNumber()) {
+    if (chainHeader.getNumber() > firstAncestorHeader.getNumber()) {
       debugLambda(
           LOG,
           "Backward reached below current chain head {} : {}",
@@ -125,19 +131,16 @@ public class BackwardsSyncAlgorithm {
 
   @VisibleForTesting
   protected CompletableFuture<Void> waitForReady() {
-    final CountDownLatch latch = new CountDownLatch(1);
-    final long idTTD =
-        context.getSyncState().subscribeTTDReached(reached -> countDownIfReady(latch));
-    final long idIS =
-        context.getSyncState().subscribeCompletionReached(() -> countDownIfReady(latch));
-    return CompletableFuture.runAsync(() -> checkReadiness(latch, idTTD, idIS));
+    final long idTTD = context.getSyncState().subscribeTTDReached(reached -> countDownIfReady());
+    final long idIS = context.getSyncState().subscribeCompletionReached(this);
+    return CompletableFuture.runAsync(() -> checkReadiness(idTTD, idIS));
   }
 
-  private void checkReadiness(final CountDownLatch latch, final long idTTD, final long idIS) {
+  private void checkReadiness(final long idTTD, final long idIS) {
     try {
       if (!context.isReady()) {
         LOG.debug("Waiting for preconditions...");
-        final boolean await = latch.await(2, TimeUnit.MINUTES);
+        final boolean await = latch.get().await(2, TimeUnit.MINUTES);
         if (await) {
           LOG.debug("Preconditions meet, ensure at least one peer is connected");
           waitForPeers(1).get();
@@ -156,9 +159,9 @@ public class BackwardsSyncAlgorithm {
     }
   }
 
-  private void countDownIfReady(final CountDownLatch latch) {
+  private void countDownIfReady() {
     if (context.isReady()) {
-      latch.countDown();
+      latch.get().countDown();
     }
   }
 
@@ -166,5 +169,15 @@ public class BackwardsSyncAlgorithm {
     final WaitForPeersTask waitForPeersTask =
         WaitForPeersTask.create(context.getEthContext(), count, context.getMetricsSystem());
     return waitForPeersTask.run();
+  }
+
+  @Override
+  public void onInitialSyncCompleted() {
+    countDownIfReady();
+  }
+
+  @Override
+  public void onInitialSyncRestart() {
+    latch.set(new CountDownLatch(1));
   }
 }

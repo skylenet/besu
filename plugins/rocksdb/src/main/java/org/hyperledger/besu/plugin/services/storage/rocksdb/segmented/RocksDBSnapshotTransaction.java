@@ -59,7 +59,8 @@ public class RocksDBSnapshotTransaction implements KeyValueStorageTransaction, A
     this.snapshot = new RocksDBSnapshot(db);
     this.writeOptions = new WriteOptions();
     this.snapTx = db.beginTransaction(writeOptions);
-    this.readOptions = new ReadOptions().setSnapshot(snapshot.markAndUseSnapshot());
+    this.readOptions =
+        new ReadOptions().setVerifyChecksums(false).setSnapshot(snapshot.markAndUseSnapshot());
   }
 
   private RocksDBSnapshotTransaction(
@@ -140,8 +141,7 @@ public class RocksDBSnapshotTransaction implements KeyValueStorageTransaction, A
 
   @Override
   public void commit() throws StorageException {
-    // no-op or throw?
-    throw new UnsupportedOperationException("RocksDBSnapshotTransaction does not support commit");
+    // no-op
   }
 
   @Override

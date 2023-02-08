@@ -16,11 +16,14 @@
 package org.hyperledger.besu.ethereum.retesteth;
 
 import org.hyperledger.besu.ethereum.core.Synchronizer;
+import org.hyperledger.besu.plugin.data.Address;
 import org.hyperledger.besu.plugin.data.SyncStatus;
 import org.hyperledger.besu.plugin.services.BesuEvents;
 
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+
+import org.apache.tuweni.bytes.Bytes;
 
 /**
  * Naive implementation of Synchronizer used by retesteth. Because retesteth is not implemented in
@@ -42,6 +45,17 @@ public class DummySynchronizer implements Synchronizer {
   @Override
   public Optional<SyncStatus> getSyncStatus() {
     return Optional.empty();
+  }
+
+  @Override
+  public boolean resyncWorldState() {
+    return false;
+  }
+
+  @Override
+  public boolean healWorldState(
+      final Optional<Address> maybeAccountToRepair, final Bytes location) {
+    return false;
   }
 
   @Override

@@ -14,6 +14,7 @@
  */
 package org.hyperledger.besu.ethereum.eth.sync.checkpointsync;
 
+import org.hyperledger.besu.datatypes.Hash;
 import org.hyperledger.besu.ethereum.ProtocolContext;
 import org.hyperledger.besu.ethereum.core.BlockHeader;
 import org.hyperledger.besu.ethereum.eth.manager.EthContext;
@@ -79,7 +80,13 @@ public class CheckpointDownloaderFactory extends SnapDownloaderFactory {
 
     final FastSyncState fastSyncState =
         fastSyncStateStorage.loadState(ScheduleBasedBlockHeaderFunctions.create(protocolSchedule));
-    if (fastSyncState.getPivotBlockHeader().isEmpty()
+
+    if (syncState.isResyncNeeded()) {
+      snapContext.clear();
+      syncState
+          .getAccountToRepair()
+          .ifPresent(address -> snapContext.addInconsistentAccount(Hash.hash(address)));
+    } else if (fastSyncState.getPivotBlockHeader().isEmpty()
         && protocolContext.getBlockchain().getChainHeadBlockNumber()
             != BlockHeader.GENESIS_BLOCK_NUMBER) {
       LOG.info(
@@ -101,10 +108,12 @@ public class CheckpointDownloaderFactory extends SnapDownloaderFactory {
               pivotBlockSelector,
               metricsSystem);
     } else {
-      LOG.info(
-          "Checkpoint sync start with block {} and hash {}",
-          syncState.getCheckpoint().get().blockNumber(),
-          syncState.getCheckpoint().get().blockHash());
+      if (!syncState.isResyncNeeded()) {
+        LOG.info(
+            "Checkpoint sync start with block {} and hash {}",
+            syncState.getCheckpoint().get().blockNumber(),
+            syncState.getCheckpoint().get().blockHash());
+      }
       fastSyncActions =
           new CheckpointSyncActions(
               syncConfig,
